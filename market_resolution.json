@@ -1,0 +1,14 @@
+{
+  "city": "São Paulo",
+  "event_slug_prefix": "highest-temperature-in-sao-paulo-on-",
+  "confirmed": false,
+  "station_id": "SBGR",
+  "source_name": "",
+  "source_url": "",
+  "timezone": "America/Sao_Paulo",
+  "unit": "C",
+  "precision": "",
+  "bucket_mode": "",
+  "period_local": "",
+  "notes": "Preencha somente após conferir as regras do contrato. O nome da cidade ou a proximidade do aeroporto não confirmam a fonte de resolução."
+}

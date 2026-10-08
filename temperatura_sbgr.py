@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Radar de temperatura SBGR + ladder Polymarket.
 
-Os preços vêm da API pública. A distribuição de temperatura usa os membros do
-ECMWF IFS e, quando aprovada pelo backtest histórico walk-forward de SBGR,
-combina também GFS e ICON. Também é possível sobrescrever mu e sigma.
+Os preços vêm da API pública. A previsão combina membros de ECMWF, GFS e ICON
+com pesos configuráveis, comparação de consenso e validação probabilística.
 """
 
 from __future__ import annotations
@@ -12,22 +11,30 @@ import argparse
 from datetime import date, datetime
 import json
 import math
+from pathlib import Path
 import re
 import sys
 import time
 from typing import Any
 
 import requests
+from quant_analysis import (
+    fit_adaptive_weights,
+    resolution_status,
+    validate_ladder,
+    walk_forward_probabilistic_backtest,
+)
 from model_engine import (
-    Calibration,
+    DEFAULT_MODEL_WEIGHTS,
     MODEL_CONFIG,
-    calibrate_models,
     choose_temperature_strategy,
     empirical_bracket_probability,
     fetch_previous_run_daily_max,
     fetch_station_daily_max,
     summarize_distribution,
     weighted_member_distribution,
+    weighted_quantile,
+    model_consensus,
 )
 
 # Preserve Portuguese accents, Greek μ/σ, and table separators in Windows terminals.
@@ -46,7 +53,7 @@ SBGR_LONGITUDE = -46.4731
 HEADERS = {"User-Agent": "SBGR-temperature-ladder/1.0 (personal dashboard)"}
 SESSION = requests.Session()
 SESSION.headers.update(HEADERS)
-_CALIBRATION_CACHE: dict[int, tuple[float, Calibration]] = {}
+_PROBABILITY_BACKTEST_CACHE: dict[tuple[int, tuple[tuple[str, float], ...]], tuple[float, dict[str, Any]]] = {}
 
 
 def get_json(url: str, params: dict[str, Any]) -> Any:
@@ -127,7 +134,13 @@ def fetch_ladder(day: date) -> list[dict[str, Any]]:
     data = get_json(GAMMA_URL, {"slug": event_slug(day)})
     if not data:
         return []
-    return data[0].get("markets", []) or []
+    event = data[0]
+    markets = event.get("markets", []) or []
+    for market in markets:
+        market["_event_slug"] = event.get("slug") or event_slug(day)
+        market["_event_title"] = event.get("title")
+        market["_event_description"] = event.get("description")
+    return markets
 
 
 def as_list(value: Any) -> list[Any]:
@@ -150,6 +163,125 @@ def no_token_id(market: dict[str, Any]) -> str | None:
         if str(outcome).strip().casefold() == "no" and index < len(token_ids):
             return str(token_ids[index])
     return None
+
+
+def outcome_token_id(market: dict[str, Any], outcome_name: str) -> str | None:
+    outcomes = as_list(market.get("outcomes"))
+    token_ids = as_list(market.get("clobTokenIds"))
+    for index, outcome in enumerate(outcomes):
+        if str(outcome).strip().casefold() == outcome_name.casefold() and index < len(token_ids):
+            return str(token_ids[index])
+    return None
+
+
+def fetch_orderbook(token_id: str) -> dict[str, Any]:
+    return get_json(f"{CLOB_URL}/book", {"token_id": token_id})
+
+
+def estimate_buy(book: dict[str, Any], contracts: float,
+                 fee_schedule: tuple[float, float] | None) -> dict[str, float | None]:
+    """Estimate the average taker fill by walking ask depth for fixed shares."""
+    asks = []
+    for level in book.get("asks") or []:
+        price = as_price(level.get("price"))
+        try:
+            size = float(level.get("size"))
+        except (TypeError, ValueError):
+            continue
+        if price is not None and 0 < price <= 1 and math.isfinite(size) and size > 0:
+            asks.append((price, size))
+    asks.sort()
+    if not asks:
+        return {"best": None, "average": None, "slippage": None, "fee": None}
+    remaining = contracts
+    paid = fee_total = 0.0
+    filled = 0.0
+    rate, exponent = fee_schedule if fee_schedule is not None else (math.nan, math.nan)
+    for price, size in asks:
+        quantity = min(size, remaining)
+        paid += quantity * price
+        filled += quantity
+        if fee_schedule is not None:
+            fee_total += quantity * rate * (price * (1.0 - price)) ** exponent
+        remaining -= quantity
+        if remaining <= 1e-9:
+            break
+    if remaining > 1e-9:
+        return {"best": asks[0][0], "average": None, "slippage": None, "fee": None}
+    average = paid / filled
+    return {"best": asks[0][0], "average": average,
+            "slippage": average - asks[0][0],
+            "fee": fee_total / filled if fee_schedule is not None else None}
+
+
+def orderbook_age_minutes(book: dict[str, Any]) -> float | None:
+    raw = book.get("timestamp") or book.get("last_update") or book.get("updatedAt")
+    if raw is None:
+        return None
+    try:
+        if isinstance(raw, (int, float)):
+            stamp = float(raw)
+            if stamp > 10_000_000_000:
+                stamp /= 1000
+            return max(0.0, (time.time() - stamp) / 60)
+        parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return None
+        return max(0.0, (datetime.now(parsed.tzinfo) - parsed).total_seconds() / 60)
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def load_resolution_config() -> dict[str, Any]:
+    path = Path(__file__).with_name("market_resolution.json")
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def get_probability_backtest(lead_days: int, prior_weights: dict[str, float],
+                             available_models: list[str] | None = None) -> dict[str, Any]:
+    """Fit weights from history before the target and return a separate OOS scorecard."""
+    if not 0 <= lead_days <= 7:
+        return {"metrics": {"n": 0, "reason": "arquivo histórico disponível apenas para D-0 a D-7"},
+                "fit": {"weights": {}, "adaptive": False, "reason": "horizonte fora do arquivo", "n": 0}}
+    available_models = available_models or list(prior_weights)
+    key = (lead_days, tuple(sorted(prior_weights.items())) + tuple((name, -1.0) for name in available_models))
+    cached = _PROBABILITY_BACKTEST_CACHE.get(key)
+    if cached and time.time() - cached[0] < 6 * 60 * 60:
+        return cached[1]
+    observations = fetch_station_daily_max()
+    # Fit and score exactly the models that contributed live members. This
+    # also makes a partial outage graceful instead of referencing absent priors.
+    active_models = [name for name in available_models if name in MODEL_CONFIG]
+    forecasts: dict[str, dict[str, float]] = {}
+    history_errors: dict[str, str] = {}
+    for name in active_models:
+        try:
+            forecasts[name] = fetch_previous_run_daily_max(MODEL_CONFIG[name]["history"], lead_days)
+        except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+            forecasts[name] = {}
+            history_errors[name] = str(exc)
+    blend_prior = {name: prior_weights.get(name, 0.0) for name in active_models
+                   if forecasts.get(name)}
+    if not forecasts:
+        return {"fit": {"weights": {}, "adaptive": False,
+                        "reason": "nenhum modelo histórico disponível", "n": 0},
+                "metrics": {"n": 0, "reason": "nenhum modelo histórico disponível"}}
+    if not blend_prior:
+        detail = "; ".join(f"{name}: {error}" for name, error in history_errors.items())
+        return {"fit": {"weights": {}, "adaptive": False,
+                        "reason": "nenhum modelo ativo tem arquivo histórico" + (f" ({detail})" if detail else ""), "n": 0},
+                "metrics": {"n": 0, "reason": "nenhum modelo ativo tem arquivo histórico"}}
+    fit = fit_adaptive_weights(observations, forecasts, blend_prior)
+    metrics = walk_forward_probabilistic_backtest(observations, forecasts, blend_prior)
+    missing_history = sorted(set(active_models) - set(blend_prior))
+    if missing_history:
+        fit["reason"] += "; sem arquivo para " + ", ".join(missing_history)
+    result = {"fit": fit, "metrics": metrics}
+    _PROBABILITY_BACKTEST_CACHE[key] = (time.time(), result)
+    return result
 
 
 def fetch_best_quotes(token_id: str) -> tuple[float | None, float | None]:
@@ -238,29 +370,6 @@ def fetch_temperature_forecast(
     return mu, sigma, len(members), source_name, members
 
 
-def get_model_calibration(lead_days: int) -> Calibration:
-    """Fetch and cache 35-day fixed-lead verification data for SBGR."""
-    now = time.time()
-    cached = _CALIBRATION_CACHE.get(lead_days)
-    if cached and now - cached[0] < 6 * 60 * 60:
-        return cached[1]
-    if not 0 <= lead_days <= 7:
-        result = Calibration(False, lead_days, 0, {}, {}, {}, {}, None, None,
-                             "arquivo de verificação disponível apenas em D-0 a D-7")
-        _CALIBRATION_CACHE[lead_days] = (now, result)
-        return result
-
-    observations = fetch_station_daily_max()
-    historical: dict[str, dict[str, float]] = {}
-    for name, config in MODEL_CONFIG.items():
-        historical[name] = fetch_previous_run_daily_max(
-            config["history"], lead_days
-        )
-    result = calibrate_models(observations, historical, lead_days)
-    _CALIBRATION_CACHE[lead_days] = (time.time(), result)
-    return result
-
-
 def normal_cdf(x: float, mu: float, sigma: float) -> float:
     return 0.5 * (1.0 + math.erf((x - mu) / (sigma * math.sqrt(2.0))))
 
@@ -294,21 +403,41 @@ def print_dashboard(day: date, mu: float | None, sigma: float | None,
                     forecast_error: str | None = None,
                     comparison_forecasts: dict[str, tuple[float, float, int, str] | str] | None = None,
                     probability_distribution: list[tuple[float, float]] | None = None,
-                    calibration: Calibration | None = None) -> None:
+                    configured_weights: dict[str, float] | None = None,
+                    effective_weights: dict[str, float] | None = None,
+                    prediction_interval: tuple[float, float] | None = None,
+                    backtest: dict[str, Any] | None = None,
+                    contracts_to_estimate: float = 10.0,
+                    quantiles: tuple[float, float, float] | None = None,
+                    forecast_fetched_at: datetime | None = None) -> None:
     print("=" * 92)
     if mu is not None and sigma is not None:
         count, source = forecast_info or (0, "parâmetros informados manualmente")
         source_text = f"{source}; {count} membros" if count else source
         print(f"[PREVISÃO DA MÁXIMA] μ={mu:.2f} °C | σ={sigma:.2f} °C | {source_text}")
         if probability_distribution:
-            print("  Probabilidades calculadas pela frequência ponderada dos membros; são estimativas, não garantias.")
+            print("  Probabilidades calculadas pela frequência ponderada dos membros; estimativas, não garantias.")
+            if prediction_interval:
+                print(f"  Intervalo de previsão empírico 95%: [{prediction_interval[0]:.2f}, {prediction_interval[1]:.2f}] °C; não é IC da média.")
+            if quantiles:
+                print(f"  P5={quantiles[0]:.2f}°C | P50={quantiles[1]:.2f}°C | P95={quantiles[2]:.2f}°C")
+            if forecast_fetched_at:
+                print(f"  Consultado em: {forecast_fetched_at.astimezone().strftime('%d/%m/%Y %H:%M:%S %Z')} (horário local; não representa a hora de inicialização do modelo).")
+            if configured_weights and effective_weights:
+                configured = ", ".join(f"{name} {weight:.0%}" for name, weight in configured_weights.items())
+                active = ", ".join(f"{name} {weight:.0%}" for name, weight in effective_weights.items())
+                print(f"  Pesos configurados: {configured} | aplicados: {active}")
+            means = {name: item[0] for name, item in (comparison_forecasts or {}).items()
+                     if isinstance(item, tuple)}
+            consensus = model_consensus(means)
+            if consensus["score"] is not None:
+                print(f"  Confiança relativa pela concordância: {consensus['level']} (heurística {consensus['score']:.0f}/100); divergência máxima {consensus['spread']:.2f}°C.")
+                if consensus["zones"]:
+                    print("  Zonas de desacordo: " + "; ".join(consensus["zones"]))
+                print("  Consenso mede proximidade entre modelos; não é chance de acerto.")
         else:
             print("  Probabilidades derivadas de distribuição normal ajustada ao ensemble; não são garantias.")
-        if calibration and calibration.enabled:
-            print("  P(YES) e EV usam a mistura ECMWF/GFS/ICON aprovada no walk-forward.")
-        elif probability_distribution:
-            print("  P(YES) e EV usam o ensemble ECMWF; GFS e ICON ficam como comparação porque a mistura não foi aprovada.")
-        else:
+        if not probability_distribution:
             print("  P(YES) e EV usam esta previsão principal; GFS e ICON são exibidos para comparação.")
     elif forecast_error:
         print(f"[PREVISÃO DA MÁXIMA] indisponível: {forecast_error}")
@@ -318,6 +447,31 @@ def print_dashboard(day: date, mu: float | None, sigma: float | None,
             print(f"[PREVISÃO {model_name}] μ={model_mu:.2f} °C | σ={model_sigma:.2f} °C | {source}; {count} membros")
         else:
             print(f"[PREVISÃO {model_name}] indisponível: {result}")
+    if backtest:
+        fit = backtest.get("fit", {})
+        metrics = backtest.get("metrics", backtest)
+        lead = max(0, (day - date.today()).days)
+        if fit:
+            print(f"[PESOS ADAPTATIVOS D-{lead}] {'ajustados' if fit.get('adaptive') else 'prior/fallback'} — {fit.get('reason', 'sem detalhe')}; amostra recente: {fit.get('n', 0)} dias.")
+            if fit.get("base_rmse") is not None and fit.get("adaptive_rmse") is not None:
+                print(f"  RMSE OOS de ajuste: prior {fit['base_rmse']:.2f}°C → candidato {fit['adaptive_rmse']:.2f}°C.")
+            if fit.get("correlations"):
+                print("  Correlação dos erros por par: " + ", ".join(f"{pair} {value:+.2f}" for pair, value in fit["correlations"].items()))
+        elif effective_weights:
+            print(f"[PESOS ADAPTATIVOS D-{lead}] prior/fallback — histórico indisponível; distribuição atual reequilibrada entre modelos disponíveis: "
+                  + ", ".join(f"{name} {weight:.0%}" for name, weight in effective_weights.items()) + ".")
+        adaptive_metrics = metrics.get("ADAPTATIVA", {})
+        if adaptive_metrics.get("n"):
+            print(f"[BACKTEST PROBABILÍSTICO WALK-FORWARD D-{lead}] {adaptive_metrics['n']} dias; "
+                  f"Brier {adaptive_metrics['brier']:.3f} | log loss {adaptive_metrics['log_loss']:.3f} | "
+                  f"CRPS {adaptive_metrics['crps']:.2f}°C | cobertura P5–P95 {adaptive_metrics['coverage_90']:.0%} | ECE {adaptive_metrics['top_bin_ece']:.3f}")
+            for name in ("PRIOR", "ECMWF", "GFS", "ICON"):
+                item = metrics.get(name, {})
+                if item.get("n"):
+                    print(f"  {name}: Brier {item['brier']:.3f} | log loss {item['log_loss']:.3f} | CRPS {item['crps']:.2f}°C | cobertura {item['coverage_90']:.0%} | ECE {item['top_bin_ece']:.3f}")
+            print("  Método: decisões sequenciais com apenas histórico anterior; máximas horárias arquivadas + distribuição de erros walk-forward, bins [n,n+1)°C.")
+        else:
+            print(f"[BACKTEST PROBABILÍSTICO] indisponível: {metrics.get('reason', 'dados insuficientes')}.")
     print(f"RADAR METEOROLÓGICO — SBGR | Ladder do dia {day:%d/%m/%Y}")
     print("=" * 92)
     try:
@@ -366,7 +520,27 @@ def print_dashboard(day: date, mu: float | None, sigma: float | None,
         if not markets:
             print("  Evento/ladder não encontrado para essa data.")
             return
-        columns = [("Faixa", 20), ("A.Y", 7), ("Spr.Y", 7), ("A.N", 7), ("Spr.N", 7), ("P(impl.)", 10), ("P(YES)", 10), ("EV YES", 10), ("EV% YES", 10), ("EV NO", 10), ("EV% NO", 10)]
+        resolution = load_resolution_config()
+        resolution_checks = [resolution_status(resolution, market, market.get("_event_slug", event_slug(day))) for market in markets]
+        resolved = all(item[0] for item in resolution_checks)
+        resolution_reason = next((item[1] for item in resolution_checks if not item[0]), "regras verificadas para todos os outcomes")
+        bucket_mode = resolution.get("bucket_mode", "interval_start")
+        ladder = validate_ladder(markets, bucket_mode)
+        can_price_ev = resolved and ladder["complete"]
+        print("\n[REGRAS DE RESOLUÇÃO]")
+        print(f"  Situação: {'confirmada' if resolved else 'FONTE DE RESOLUÇÃO NÃO CONFIRMADA'} — {resolution_reason}")
+        print(f"  Estação que precisa ser confirmada: {resolution.get('station_id') or 'não configurada'}")
+        if resolution.get("source_name"):
+            print(f"  Fonte configurada: {resolution.get('source_name')} | estação: {resolution.get('station_id')} | fuso: {resolution.get('timezone')} | unidade: {resolution.get('unit')} | precisão: {resolution.get('precision')} | período: {resolution.get('period_local')}")
+        print(f"  Semântica de fronteira configurada: {resolution.get('bucket_mode') or 'não informada'}")
+        print(f"  Fonte indicada nas regras/API: {markets[0].get('resolutionSource') or markets[0].get('resolvedBy') or 'não informada'}")
+        print(f"  Regras: {resolution.get('source_url') or markets[0].get('resolutionSource') or 'URL de regras não disponível'}")
+        print(f"  Ladder: {'válida' if ladder['complete'] else 'não validada'} — {ladder['reason']}")
+        if not resolved:
+            print("  P(modelo), EV e recomendação ficam suspensos até confirmar a regra, estação e precisão no arquivo market_resolution.json.")
+        elif not ladder["complete"]:
+            print("  P(modelo), EV e recomendação ficam suspensos até corrigir/confirmar as fronteiras das faixas.")
+        columns = [("Faixa", 20), ("A.Y", 7), ("Spr.Y", 7), ("Sl.Y", 7), ("A.N", 7), ("Spr.N", 7), ("Sl.N", 7), ("P(impl.)", 10), ("P(YES)", 10), ("Edge", 9), ("EV YES", 10), ("EV% YES", 10), ("EV NO", 10), ("EV% NO", 10), ("Estado", 12)]
         def render_row(values: list[str]) -> str:
             cells = [f"{values[0]:<20.20}"] + [f"{value:>{columns[i][1]}}" for i, value in enumerate(values[1:], 1)]
             return "| " + " | ".join(cells) + " |"
@@ -374,49 +548,95 @@ def print_dashboard(day: date, mu: float | None, sigma: float | None,
         print(table_rule)
         print(render_row([name for name, _ in columns]))
         print(table_rule)
+        probabilities_total = 0.0
+        strategy_markets: list[dict[str, Any]] = []
         for market in markets:
             label = market.get("groupItemTitle") or market.get("question") or "Faixa sem nome"
             bid = as_price(market.get("bestBid"))
             ask = as_price(market.get("bestAsk"))
+            yes_bid, yes_ask = bid, ask
             bid_no = ask_no = None
-            no_id = no_token_id(market)
-            if no_id:
-                try:
-                    bid_no, ask_no = fetch_best_quotes(no_id)
-                except requests.RequestException:
-                    # Keep the rest of the ladder visible if the NO book is unavailable.
-                    pass
-            probability = (
-                empirical_bracket_probability(str(label), probability_distribution)
+            yes_fill = {"average": None, "slippage": None, "fee": None}
+            no_fill = {"average": None, "slippage": None, "fee": None}
+            ages: list[float] = []
+            schedule = market_fee_schedule(market)
+            yes_id = outcome_token_id(market, "Yes")
+            no_id = outcome_token_id(market, "No")
+            try:
+                if yes_id:
+                    yes_book = fetch_orderbook(yes_id)
+                    yes_levels_bid = [as_price(x.get("price")) for x in (yes_book.get("bids") or [])]
+                    yes_bid = max((x for x in yes_levels_bid if x is not None), default=yes_bid)
+                    yes_fill = estimate_buy(yes_book, contracts_to_estimate, schedule)
+                    age = orderbook_age_minutes(yes_book)
+                    if age is not None:
+                        ages.append(age)
+                if no_id:
+                    no_book = fetch_orderbook(no_id)
+                    no_levels_bid = [as_price(x.get("price")) for x in (no_book.get("bids") or [])]
+                    bid_no = max((x for x in no_levels_bid if x is not None), default=None)
+                    no_fill = estimate_buy(no_book, contracts_to_estimate, schedule)
+                    ask_no = no_fill["best"]
+                    age = orderbook_age_minutes(no_book)
+                    if age is not None:
+                        ages.append(age)
+            except requests.RequestException:
+                pass
+            ask = yes_fill["best"] if yes_fill["best"] is not None else yes_ask
+            spread_yes = ask - yes_bid if ask is not None and yes_bid is not None else None
+            spread_no = ask_no - bid_no if ask_no is not None and bid_no is not None else None
+            model_probability = (
+                empirical_bracket_probability(str(label), probability_distribution, bucket_mode)
                 if probability_distribution
                 else bracket_probability(str(label), mu, sigma) if mu is not None and sigma is not None else None
-            )
+            ) if can_price_ev else None
+            probability = model_probability
+            if probability is not None:
+                probabilities_total += probability
             no_probability = 1.0 - probability if probability is not None else None
-            schedule = market_fee_schedule(market)
-            fee_yes = taker_fee_per_contract(ask, schedule) if ask is not None else None
-            fee_no = taker_fee_per_contract(ask_no, schedule) if ask_no is not None else None
-            ev_yes_net = probability - ask - fee_yes if probability is not None and ask is not None and fee_yes is not None else None
-            ev_no_net = no_probability - ask_no - fee_no if no_probability is not None and ask_no is not None and fee_no is not None else None
-            ev_yes_pct = ev_yes_net / (ask + fee_yes) * 100 if ev_yes_net is not None and ask is not None and fee_yes is not None and ask + fee_yes > 0 else None
-            ev_no_pct = ev_no_net / (ask_no + fee_no) * 100 if ev_no_net is not None and ask_no is not None and fee_no is not None and ask_no + fee_no > 0 else None
-            spread_yes = ask - bid if ask is not None and bid is not None else None
-            spread_no = ask_no - bid_no if ask_no is not None and bid_no is not None else None
-            implied = ((bid + ask) / 2) if bid is not None and ask is not None else (ask if ask is not None else bid)
+            fresh = not ages or max(ages) <= 15
+            complete_depth_yes = yes_fill["average"] is not None
+            complete_depth_no = no_fill["average"] is not None
+            fee_yes, fee_no = yes_fill["fee"], no_fill["fee"]
+            ev_yes_net = probability - yes_fill["average"] - fee_yes if can_price_ev and fresh and complete_depth_yes and fee_yes is not None and probability is not None else None
+            ev_no_net = no_probability - no_fill["average"] - fee_no if can_price_ev and fresh and complete_depth_no and fee_no is not None and no_probability is not None else None
+            ev_yes_pct = ev_yes_net / (yes_fill["average"] + fee_yes) * 100 if ev_yes_net is not None and yes_fill["average"] is not None and fee_yes is not None and yes_fill["average"] + fee_yes > 0 else None
+            ev_no_pct = ev_no_net / (no_fill["average"] + fee_no) * 100 if ev_no_net is not None and no_fill["average"] is not None and fee_no is not None and no_fill["average"] + fee_no > 0 else None
+            implied = ((yes_bid + ask) / 2) if yes_bid is not None and ask is not None else (ask if ask is not None else yes_bid)
+            edge = probability - implied if probability is not None and implied is not None else None
+            if not ages:
+                status = "idade ?"
+            elif not fresh:
+                status = f"stale {max(ages):.0f}m"
+            elif schedule is None:
+                status = "taxa ?"
+            elif not complete_depth_yes or not complete_depth_no:
+                status = "profundidade < alvo"
+            else:
+                status = "atual"
 
             def cell(value: float | None, fmt: str) -> str:
                 return format(value, fmt) if value is not None else "—"
 
-            row = [str(label), cell(ask, ".3f"), cell(spread_yes, ".3f"), cell(ask_no, ".3f"), cell(spread_no, ".3f"), f"{cell(implied * 100 if implied is not None else None, '.3f')}%", f"{cell(probability * 100 if probability is not None else None, '.3f')}%", cell(ev_yes_net, "+.3f"), f"{cell(ev_yes_pct, '+.3f')}%", cell(ev_no_net, "+.3f"), f"{cell(ev_no_pct, '+.3f')}%"]
+            row = [str(label), cell(ask, ".3f"), cell(spread_yes, ".3f"), cell(yes_fill["slippage"], ".3f"), cell(ask_no, ".3f"), cell(spread_no, ".3f"), cell(no_fill["slippage"], ".3f"), f"{cell(implied * 100 if implied is not None else None, '.3f')}%", f"{cell(probability * 100 if probability is not None else None, '.3f')}%", f"{cell(edge * 100 if edge is not None else None, '+.3f')}%", cell(ev_yes_net, "+.3f"), f"{cell(ev_yes_pct, '+.3f')}%", cell(ev_no_net, "+.3f"), f"{cell(ev_no_pct, '+.3f')}%", status]
             print(render_row(row))
             print(table_rule)
+            if can_price_ev and probability_distribution and yes_fill["average"] is not None and fee_yes is not None and fresh:
+                effective_cost = yes_fill["average"] + fee_yes
+                if effective_cost < 1:
+                    strategy_markets.append({**market, "bestAsk": effective_cost})
         print("\n  B/A = best bid/ask; Spr. = Ask − Bid. O ask já incorpora o spread pago ao cruzar o livro;")
-        print("  ele não é subtraído duas vezes. EV YES/NO e EV% já incluem o desconto da taxa taker do mercado.")
-        print("  EV líquido = P(resultado) − Ask − taxa; EV% = EV líquido ÷ (Ask + taxa) × 100.")
-        if probability_distribution:
+        print(f"  Sl. = preço médio estimado acima do melhor ask para {contracts_to_estimate:g} contratos; EV usa profundidade, taxa por nível e slippage estimado.")
+        print("  Preço implícito usa o meio do spread quando bid/ask existem; é referência, não preço executável.")
+        if can_price_ev:
+            print(f"  Soma das probabilidades da ladder: {probabilities_total * 100:.2f}%" +
+                  (" — alerta: confira faixas/regras." if abs(probabilities_total - 1.0) > 0.03 else " — cobertura coerente."))
+        if can_price_ev and probability_distribution:
             strategy = choose_temperature_strategy(
-                markets,
+                strategy_markets,
                 probability_distribution,
-                lambda price, market: taker_fee_per_contract(price, market_fee_schedule(market)),
+                lambda price, market: 0.0,
+                bucket_mode,
             )
             print("\n  SUGESTÃO DE TEMPERATURA (estimativa; sem execução de ordens):")
             if strategy:
@@ -424,29 +644,9 @@ def print_dashboard(day: date, mu: float | None, sigma: float | None,
                 print(f"    {strategy['kind']}: {labels}")
                 print(f"    Probabilidade de acerto conjunta estimada: {strategy['probability'] * 100:.2f}%")
                 print(f"    Custo total estimado: ${strategy['cost']:.3f} | EV líquido: ${strategy['ev']:+.3f} | EV%: {strategy['roi'] * 100:+.2f}%")
-                print("    Considera taxa taker disponível; exclui slippage e não garante lucro.")
+                print(f"    Estimativa baseada no livro para {contracts_to_estimate:g} contratos, com taxa e slippage; não garante lucro.")
             else:
                 print("    Nenhuma faixa ou cesta adjacente apresentou EV líquido positivo com as cotações atuais.")
-            if calibration:
-                if calibration.enabled:
-                    print(f"    Pesos validados em walk-forward D-{calibration.lead_days} ({calibration.sample_days} dias): "
-                          + ", ".join(f"{name} {weight:.0%}" for name, weight in calibration.weights.items()))
-                    if calibration.walkforward_ecmwf_rmse is not None and calibration.walkforward_blend_rmse is not None:
-                        print(f"    RMSE fora da amostra: ECMWF {calibration.walkforward_ecmwf_rmse:.2f}°C → mistura {calibration.walkforward_blend_rmse:.2f}°C")
-                else:
-                    print(f"    Mistura desativada; P/EV usa ECMWF sem combinação: {calibration.reason}.")
-                if calibration.sample_days and calibration.rmse:
-                    metric_lines = []
-                    for name in ("ECMWF", "GFS", "ICON"):
-                        if name in calibration.rmse:
-                            metric_lines.append(
-                                f"{name}: viés {calibration.biases[name]:+.2f}°C, "
-                                f"MAE {calibration.mae[name]:.2f}°C, "
-                                f"RMSE {calibration.rmse[name]:.2f}°C"
-                            )
-                    if metric_lines:
-                        print(f"    Verificação de máximas observadas em SBGR, D-{calibration.lead_days}, "
-                              f"{calibration.sample_days} dias: " + " | ".join(metric_lines))
         if mu is None:
             print("  Sem previsão: probabilidade estimada e EV não foram calculados.")
     except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
@@ -461,6 +661,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sigma", type=float, help="Substitui o desvio padrão automático em °C (σ), maior que zero.")
     parser.add_argument("--watch", action="store_true", help="Atualiza continuamente até Ctrl+C.")
     parser.add_argument("--interval", type=int, default=300, help="Intervalo entre consultas em segundos (padrão: 300).")
+    parser.add_argument("--weights", default="ECMWF=0.5,GFS=0.3,ICON=0.2",
+                        help="Pesos dos modelos, por exemplo ECMWF=0.5,GFS=0.3,ICON=0.2 (soma 1).")
+    parser.add_argument("--contracts", type=float, default=10.0,
+                        help="Tamanho usado para estimar slippage no livro (padrão: 10 contratos).")
     args = parser.parse_args()
     if (args.mu is None) != (args.sigma is None):
         parser.error("informe --mu e --sigma juntos")
@@ -468,6 +672,22 @@ def parse_args() -> argparse.Namespace:
         parser.error("--sigma deve ser maior que zero")
     if args.interval < 60:
         parser.error("--interval deve ser de pelo menos 60 segundos para respeitar os serviços consultados")
+    try:
+        args.model_weights = {}
+        for component in args.weights.split(","):
+            name, value = component.split("=", 1)
+            name = name.strip().upper()
+            if name not in DEFAULT_MODEL_WEIGHTS or name in args.model_weights:
+                raise ValueError
+            args.model_weights[name] = float(value)
+        if set(args.model_weights) != set(DEFAULT_MODEL_WEIGHTS) or any(
+            not math.isfinite(value) or value < 0 for value in args.model_weights.values()
+        ) or not math.isclose(sum(args.model_weights.values()), 1.0, abs_tol=1e-6):
+            raise ValueError
+    except (ValueError, TypeError):
+        parser.error("--weights deve listar ECMWF, GFS e ICON com pesos não negativos somando 1")
+    if not math.isfinite(args.contracts) or args.contracts <= 0:
+        parser.error("--contracts deve ser maior que zero")
     return args
 
 
@@ -491,46 +711,64 @@ def main() -> None:
                 model_mu, model_sigma, count, model_source, members = result
                 member_sets[model_name] = members
                 model_summaries[model_name] = (model_mu, model_sigma, count, model_source)
-                if model_name != "ECMWF":
-                    comparison_forecasts[model_name] = model_summaries[model_name]
+                comparison_forecasts[model_name] = model_summaries[model_name]
             except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
-                if model_name == "ECMWF" and mu is None:
-                    forecast_error = str(exc)
-                elif model_name != "ECMWF":
-                    comparison_forecasts[model_name] = str(exc)
+                comparison_forecasts[model_name] = str(exc)
+                if mu is None and not member_sets:
+                    forecast_error = f"nenhum ensemble disponível: {exc}"
 
         probability_distribution: list[tuple[float, float]] | None = None
-        calibration: Calibration | None = None
-        if args.mu is None and args.sigma is None and "ECMWF" in member_sets:
+        effective_weights: dict[str, float] = {}
+        prediction_interval: tuple[float, float] | None = None
+        forecast_quantiles: tuple[float, float, float] | None = None
+        forecast_fetched_at: datetime | None = None
+        backtest: dict[str, Any] | None = None
+        if args.mu is None and args.sigma is None and member_sets:
             lead_days = max(0, (args.date - date.today()).days)
             try:
-                calibration = get_model_calibration(lead_days)
+                backtest = get_probability_backtest(lead_days, args.model_weights, list(member_sets))
             except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
-                calibration = Calibration(False, lead_days, 0, {}, {}, {}, {}, None, None,
-                                           f"não foi possível obter o histórico: {exc}")
-            if calibration.enabled and not all(name in member_sets for name in MODEL_CONFIG):
-                calibration.enabled = False
-                calibration.reason = "um ou mais ensembles atuais estão indisponíveis"
-            probability_distribution = weighted_member_distribution(member_sets, calibration)
+                backtest = {"metrics": {"n": 0, "reason": f"não foi possível obter o arquivo histórico: {exc}"},
+                            "fit": {"weights": {}, "adaptive": False, "reason": "histórico indisponível; usando pesos-base", "n": 0}}
+            fitted = (backtest.get("fit") or {}).get("weights") or {}
+            fitted_live = {name: fitted[name] for name in member_sets if name in fitted}
+            if fitted_live:
+                # Do not pretend a live model is calibrated when its historical
+                # archive is absent; renormalize across the historically usable set.
+                effective_weights = fitted_live
+                norm = sum(effective_weights.values())
+                effective_weights = {name: value / norm for name, value in effective_weights.items()} if norm > 0 else {}
+            if not effective_weights:
+                prior_total = sum(args.model_weights[name] for name in member_sets)
+                if prior_total > 0:
+                    effective_weights = {name: args.model_weights[name] / prior_total for name in member_sets}
+                elif member_sets:
+                    effective_weights = {name: 1 / len(member_sets) for name in member_sets}
+            probability_distribution = weighted_member_distribution(
+                member_sets, configured_weights=effective_weights
+            )
             if probability_distribution:
                 mu, sigma = summarize_distribution(probability_distribution)
+                forecast_fetched_at = datetime.now().astimezone()
+                count = sum(len(values) for values in member_sets.values())
+                forecast_info = (count, "mistura empírica " + "+".join(member_sets))
+                low, high = weighted_quantile(probability_distribution, 0.025), weighted_quantile(probability_distribution, 0.975)
+                if low is not None and high is not None:
+                    prediction_interval = (low, high)
+                p05 = weighted_quantile(probability_distribution, 0.05)
+                p50 = weighted_quantile(probability_distribution, 0.50)
+                p95 = weighted_quantile(probability_distribution, 0.95)
+                if p05 is not None and p50 is not None and p95 is not None:
+                    forecast_quantiles = (p05, p50, p95)
             else:
-                mu, sigma, count, source = model_summaries["ECMWF"]
-                forecast_info = (count, source)
-            if calibration.enabled:
-                weights_text = ", ".join(
-                    f"{name} {weight:.0%}" for name, weight in calibration.weights.items()
-                )
-                forecast_info = (sum(len(values) for values in member_sets.values()),
-                                 f"mistura multimodelo calibrada — {weights_text}")
-            elif probability_distribution:
-                count = len(member_sets["ECMWF"])
-                forecast_info = (count, "ECMWF IFS ensemble (mistura não aprovada no backtest)")
+                forecast_error = "os modelos disponíveis têm peso efetivo zero"
         elif mu is not None and sigma is not None:
             forecast_info = (0, "μ e σ informados manualmente")
 
         print_dashboard(args.date, mu, sigma, forecast_info, forecast_error,
-                        comparison_forecasts, probability_distribution, calibration)
+                        comparison_forecasts, probability_distribution,
+                        args.model_weights, effective_weights, prediction_interval,
+                        backtest, args.contracts, forecast_quantiles, forecast_fetched_at)
         if not args.watch:
             break
         try:

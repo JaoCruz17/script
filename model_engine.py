@@ -33,6 +33,7 @@ MODEL_CONFIG = {
     "GFS": {"live": "ncep_gefs025", "history": "ncep_gefs025_ensemble_mean"},
     "ICON": {"live": "dwd_icon_global_eps", "history": "dwd_icon_eps_ensemble_mean"},
 }
+DEFAULT_MODEL_WEIGHTS = {"ECMWF": 0.50, "GFS": 0.30, "ICON": 0.20}
 MIN_PAIRED_DAYS = 30
 MIN_TRAIN_DAYS = 15
 HISTORY_DAYS = 180
@@ -219,27 +220,67 @@ def calibrate_models(
 
 
 def weighted_member_distribution(
-    member_sets: dict[str, list[float]], calibration: Calibration,
+    member_sets: dict[str, list[float]], calibration: Calibration | None = None,
     model_order: tuple[str, str, str] = ("ECMWF", "GFS", "ICON"),
+    configured_weights: dict[str, float] | None = None,
 ) -> list[tuple[float, float]]:
-    """Return (temperature, probability mass) pairs for pooled members."""
-    if not calibration.enabled:
+    """Return a normalized weighted empirical distribution over available models."""
+    # Backward-compatible behavior for callers using the former calibration API.
+    if calibration is not None and not calibration.enabled and configured_weights is None:
         values = member_sets.get("ECMWF", [])
         if not values:
             return []
-        mass = 1.0 / len(values)
-        return [(value, mass) for value in values]
+        return [(value, 1.0 / len(values)) for value in values]
+    weights = configured_weights or DEFAULT_MODEL_WEIGHTS
+    available = {name: member_sets.get(name, []) for name in model_order
+                 if member_sets.get(name)}
+    total = sum(max(0.0, weights.get(name, 0.0)) for name in available)
+    if not available:
+        return []
+    if total <= 0:
+        weights = {name: 1.0 / len(available) for name in available}
+        total = 1.0
     distribution: list[tuple[float, float]] = []
     for name in model_order:
-        values = member_sets.get(name, [])
-        weight = calibration.weights.get(name, 0.0)
+        values = available.get(name, [])
+        weight = max(0.0, weights.get(name, 0.0)) / total if values else 0.0
         if not values or weight <= 0:
             continue
         per_member = weight / len(values)
-        correction = calibration.biases.get(name, 0.0)
         for value in values:
-            distribution.append((value - correction, per_member))
+            distribution.append((value, per_member))
     return distribution
+
+
+def weighted_quantile(distribution: list[tuple[float, float]], quantile: float) -> float | None:
+    """Weighted empirical quantile for the forecast range, not a mean confidence interval."""
+    if not distribution or not 0 <= quantile <= 1:
+        return None
+    ordered = sorted((value, weight) for value, weight in distribution if weight > 0)
+    total = sum(weight for _, weight in ordered)
+    if total <= 0:
+        return None
+    threshold = quantile * total
+    cumulative = 0.0
+    for value, weight in ordered:
+        cumulative += weight
+        if cumulative >= threshold:
+            return value
+    return ordered[-1][0]
+
+
+def model_consensus(model_means: dict[str, float]) -> dict[str, Any]:
+    """Heuristic agreement indicator; it is not a probability of forecast accuracy."""
+    means = list(model_means.items())
+    if len(means) < 2:
+        return {"spread": None, "score": None, "level": "insuficiente", "zones": []}
+    spread = max(value for _, value in means) - min(value for _, value in means)
+    pairs = [(f"{means[i][0]} × {means[j][0]}", abs(means[i][1] - means[j][1]))
+             for i in range(len(means)) for j in range(i + 1, len(means))]
+    zones = [f"{pair} ({delta:.1f}°C)" for pair, delta in pairs if delta >= 1.0]
+    score = 100 * sum(math.exp(-delta / 2.0) for _, delta in pairs) / len(pairs)
+    level = "alta" if spread <= 1 else "moderada" if spread <= 2 else "baixa"
+    return {"spread": spread, "score": score, "level": level, "zones": zones}
 
 
 def summarize_distribution(distribution: list[tuple[float, float]]) -> tuple[float, float]:
@@ -252,8 +293,9 @@ def summarize_distribution(distribution: list[tuple[float, float]]) -> tuple[flo
     return mean, math.sqrt(variance)
 
 
-def empirical_bracket_probability(label: str, distribution: list[tuple[float, float]]) -> float | None:
-    """Probability for integer Celsius buckets, with exact half-open bounds."""
+def empirical_bracket_probability(label: str, distribution: list[tuple[float, float]],
+                                  bucket_mode: str = "interval_start") -> float | None:
+    """Probability for a market bracket, with exact half-open Celsius bounds."""
     import re
 
     text = (label or "").strip().lower().replace("°", "")
@@ -262,14 +304,14 @@ def empirical_bracket_probability(label: str, distribution: list[tuple[float, fl
         return None
     lower = upper = None
     if any(token in text for token in ("below", "or less", "or lower", "ou menos", "ou abaixo")):
-        upper = numbers[0] + 1
+        upper = numbers[0] + (0.5 if bucket_mode == "nearest_degree" else 1)
     elif any(token in text for token in ("higher", "or more", "or above", "ou mais", "ou acima")):
-        lower = numbers[0]
+        lower = numbers[0] - (0.5 if bucket_mode == "nearest_degree" else 0)
     elif len(numbers) >= 2:
         low, high = sorted(numbers[:2])
-        lower, upper = low, high + 1
+        lower, upper = (low - 0.5, high + 0.5) if bucket_mode == "nearest_degree" else (low, high + 1)
     else:
-        lower, upper = numbers[0], numbers[0] + 1
+        lower, upper = (numbers[0] - 0.5, numbers[0] + 0.5) if bucket_mode == "nearest_degree" else (numbers[0], numbers[0] + 1)
     total = sum(weight for _, weight in distribution)
     if total <= 0:
         return None
@@ -282,12 +324,13 @@ def empirical_bracket_probability(label: str, distribution: list[tuple[float, fl
 
 def choose_temperature_strategy(markets: list[dict[str, Any]],
                                 distribution: list[tuple[float, float]],
-                                fee_for_price: Any) -> dict[str, Any] | None:
+                                fee_for_price: Any,
+                                bucket_mode: str = "interval_start") -> dict[str, Any] | None:
     """Choose the best positive-net-EV single bucket or adjacent two-bucket basket."""
     priced: list[dict[str, Any]] = []
     for market in markets:
         label = str(market.get("groupItemTitle") or market.get("question") or "")
-        probability = empirical_bracket_probability(label, distribution)
+        probability = empirical_bracket_probability(label, distribution, bucket_mode)
         try:
             ask = float(market.get("bestAsk"))
             if not math.isfinite(ask) or not 0 < ask <= 1:
