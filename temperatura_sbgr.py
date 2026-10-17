@@ -540,30 +540,37 @@ def print_dashboard(day: date, mu: float | None, sigma: float | None,
             print("  P(modelo), EV e recomendação ficam suspensos até confirmar a regra, estação e precisão no arquivo market_resolution.json.")
         elif not ladder["complete"]:
             print("  P(modelo), EV e recomendação ficam suspensos até corrigir/confirmar as fronteiras das faixas.")
-        columns = [("Faixa", 20), ("A.Y", 7), ("Spr.Y", 7), ("Sl.Y", 7), ("A.N", 7), ("Spr.N", 7), ("Sl.N", 7), ("P(impl.)", 10), ("P(YES)", 10), ("Edge", 9), ("EV YES", 10), ("EV% YES", 10), ("EV NO", 10), ("EV% NO", 10), ("Estado", 12)]
-        def render_row(values: list[str]) -> str:
+        quote_columns = [("Faixa", 20), ("Ask YES", 9), ("Spr YES", 9), ("Slippage YES", 12), ("Ask NO", 9), ("Spr NO", 9), ("Slippage NO", 12)]
+        value_columns = [("Faixa", 20), ("P(impl.)", 10), ("P(YES)", 10), ("Edge", 9), ("EV YES", 10), ("EV% YES", 10), ("EV NO", 10), ("EV% NO", 10)]
+        def render_row(values: list[str], columns: list[tuple[str, int]]) -> str:
             cells = [f"{values[0]:<20.20}"] + [f"{value:>{columns[i][1]}}" for i, value in enumerate(values[1:], 1)]
             return "| " + " | ".join(cells) + " |"
-        table_rule = "-" * len(render_row([name for name, _ in columns]))
-        print(table_rule)
-        print(render_row([name for name, _ in columns]))
-        print(table_rule)
+        quote_rule = "-" * len(render_row([name for name, _ in quote_columns], quote_columns))
+        value_rule = "-" * len(render_row([name for name, _ in value_columns], value_columns))
+        if not resolved:
+            print(f"  P(YES), Edge e EV suspensos: {resolution_reason}.")
+        elif not ladder["complete"]:
+            print(f"  P(YES), Edge e EV suspensos: ladder não validada ({ladder['reason']}).")
         probabilities_total = 0.0
         strategy_markets: list[dict[str, Any]] = []
+        quote_rows: list[list[str]] = []
+        value_rows: list[list[str]] = []
+        quote_warnings: list[tuple[str, str]] = []
         for market in markets:
             label = market.get("groupItemTitle") or market.get("question") or "Faixa sem nome"
             bid = as_price(market.get("bestBid"))
             ask = as_price(market.get("bestAsk"))
             yes_bid, yes_ask = bid, ask
             bid_no = ask_no = None
-            yes_fill = {"average": None, "slippage": None, "fee": None}
-            no_fill = {"average": None, "slippage": None, "fee": None}
+            yes_fill = {"best": None, "average": None, "slippage": None, "fee": None}
+            no_fill = {"best": None, "average": None, "slippage": None, "fee": None}
             ages: list[float] = []
+            quote_errors: list[str] = []
             schedule = market_fee_schedule(market)
             yes_id = outcome_token_id(market, "Yes")
             no_id = outcome_token_id(market, "No")
-            try:
-                if yes_id:
+            if yes_id:
+                try:
                     yes_book = fetch_orderbook(yes_id)
                     yes_levels_bid = [as_price(x.get("price")) for x in (yes_book.get("bids") or [])]
                     yes_bid = max((x for x in yes_levels_bid if x is not None), default=yes_bid)
@@ -571,7 +578,14 @@ def print_dashboard(day: date, mu: float | None, sigma: float | None,
                     age = orderbook_age_minutes(yes_book)
                     if age is not None:
                         ages.append(age)
-                if no_id:
+                    else:
+                        quote_errors.append("idade do livro YES desconhecida: timestamp ausente")
+                except requests.RequestException as exc:
+                    quote_errors.append(f"YES indisponível: {exc}")
+            else:
+                quote_errors.append("token YES ausente no mercado")
+            if no_id:
+                try:
                     no_book = fetch_orderbook(no_id)
                     no_levels_bid = [as_price(x.get("price")) for x in (no_book.get("bids") or [])]
                     bid_no = max((x for x in no_levels_bid if x is not None), default=None)
@@ -580,8 +594,12 @@ def print_dashboard(day: date, mu: float | None, sigma: float | None,
                     age = orderbook_age_minutes(no_book)
                     if age is not None:
                         ages.append(age)
-            except requests.RequestException:
-                pass
+                    else:
+                        quote_errors.append("idade do livro NO desconhecida: timestamp ausente")
+                except requests.RequestException as exc:
+                    quote_errors.append(f"NO indisponível: {exc}")
+            else:
+                quote_errors.append("token NO ausente no mercado")
             ask = yes_fill["best"] if yes_fill["best"] is not None else yes_ask
             spread_yes = ask - yes_bid if ask is not None and yes_bid is not None else None
             spread_no = ask_no - bid_no if ask_no is not None and bid_no is not None else None
@@ -602,29 +620,44 @@ def print_dashboard(day: date, mu: float | None, sigma: float | None,
             ev_no_net = no_probability - no_fill["average"] - fee_no if can_price_ev and fresh and complete_depth_no and fee_no is not None and no_probability is not None else None
             ev_yes_pct = ev_yes_net / (yes_fill["average"] + fee_yes) * 100 if ev_yes_net is not None and yes_fill["average"] is not None and fee_yes is not None and yes_fill["average"] + fee_yes > 0 else None
             ev_no_pct = ev_no_net / (no_fill["average"] + fee_no) * 100 if ev_no_net is not None and no_fill["average"] is not None and fee_no is not None and no_fill["average"] + fee_no > 0 else None
+            if ages and not fresh:
+                quote_errors.append(f"book com {max(ages):.0f} min; EV desconsiderado")
+            if can_price_ev and probability is None:
+                quote_errors.append("P(YES), Edge e EV indisponíveis: previsão da temperatura ausente")
+            if can_price_ev and schedule is None:
+                quote_errors.append("EV indisponível: taxa taker desconhecida")
+            if can_price_ev and not complete_depth_yes:
+                quote_errors.append("EV YES indisponível: profundidade abaixo do tamanho solicitado")
+            if can_price_ev and not complete_depth_no:
+                quote_errors.append("EV NO indisponível: profundidade abaixo do tamanho solicitado")
             implied = ((yes_bid + ask) / 2) if yes_bid is not None and ask is not None else (ask if ask is not None else yes_bid)
             edge = probability - implied if probability is not None and implied is not None else None
-            if not ages:
-                status = "idade ?"
-            elif not fresh:
-                status = f"stale {max(ages):.0f}m"
-            elif schedule is None:
-                status = "taxa ?"
-            elif not complete_depth_yes or not complete_depth_no:
-                status = "profundidade < alvo"
-            else:
-                status = "atual"
-
             def cell(value: float | None, fmt: str) -> str:
                 return format(value, fmt) if value is not None else "—"
 
-            row = [str(label), cell(ask, ".3f"), cell(spread_yes, ".3f"), cell(yes_fill["slippage"], ".3f"), cell(ask_no, ".3f"), cell(spread_no, ".3f"), cell(no_fill["slippage"], ".3f"), f"{cell(implied * 100 if implied is not None else None, '.3f')}%", f"{cell(probability * 100 if probability is not None else None, '.3f')}%", f"{cell(edge * 100 if edge is not None else None, '+.3f')}%", cell(ev_yes_net, "+.3f"), f"{cell(ev_yes_pct, '+.3f')}%", cell(ev_no_net, "+.3f"), f"{cell(ev_no_pct, '+.3f')}%", status]
-            print(render_row(row))
-            print(table_rule)
+            quote_rows.append([str(label), cell(ask, ".3f"), cell(spread_yes, ".3f"), cell(yes_fill["slippage"], ".3f"), cell(ask_no, ".3f"), cell(spread_no, ".3f"), cell(no_fill["slippage"], ".3f")])
+            value_rows.append([str(label), f"{cell(implied * 100 if implied is not None else None, '.3f')}%", f"{cell(probability * 100 if probability is not None else None, '.3f')}%", f"{cell(edge * 100 if edge is not None else None, '+.3f')}%", cell(ev_yes_net, "+.3f"), f"{cell(ev_yes_pct, '+.3f')}%", cell(ev_no_net, "+.3f"), f"{cell(ev_no_pct, '+.3f')}%"])
+            quote_warnings.extend((str(label), error) for error in quote_errors)
             if can_price_ev and probability_distribution and yes_fill["average"] is not None and fee_yes is not None and fresh:
                 effective_cost = yes_fill["average"] + fee_yes
                 if effective_cost < 1:
                     strategy_markets.append({**market, "bestAsk": effective_cost})
+        print("\n[BOOK — COTAÇÕES]")
+        print(quote_rule)
+        print(render_row([name for name, _ in quote_columns], quote_columns))
+        print(quote_rule)
+        for row in quote_rows:
+            print(render_row(row, quote_columns))
+            print(quote_rule)
+        print("\n[PROBABILIDADES E VALOR]")
+        print(value_rule)
+        print(render_row([name for name, _ in value_columns], value_columns))
+        print(value_rule)
+        for row in value_rows:
+            print(render_row(row, value_columns))
+            print(value_rule)
+        for label, error in quote_warnings:
+            print(f"  Aviso — {label}: {error}")
         print("\n  B/A = best bid/ask; Spr. = Ask − Bid. O ask já incorpora o spread pago ao cruzar o livro;")
         print(f"  Sl. = preço médio estimado acima do melhor ask para {contracts_to_estimate:g} contratos; EV usa profundidade, taxa por nível e slippage estimado.")
         print("  Preço implícito usa o meio do spread quando bid/ask existem; é referência, não preço executável.")

@@ -60,9 +60,11 @@ Para a implementação atual, `precision` precisa ser `1°C`. Marque `confirmed`
 
 ## Livro, taxas e qualidade das cotações
 
+- O dashboard separa cotações do livro e métricas de probabilidade/valor em duas tabelas para evitar que colunas à direita sejam cortadas no terminal. `Slippage YES` e `Slippage NO` são o slippage estimado de cada outcome.
 - Busca books YES e NO no CLOB e estima o preço médio para o número configurado de contratos, caminhando pelos níveis de ask.
 - Slippage é a diferença entre o ask mais baixo e o preço médio estimado. EV usa preço médio, taxa taker calculada nível a nível e probabilidade modelada; EV% divide o EV líquido pelo custo total.
-- Se o book não cobrir todo o tamanho pedido ou a taxa for desconhecida, o EV desse lado fica em branco. Books com timestamp acima de 15 minutos são marcados como antigos e excluídos do EV. Quando a API não fornece timestamp, o estado mostra `idade ?` para deixar a limitação visível.
+- Se o book não cobrir todo o tamanho pedido ou a taxa for desconhecida, o EV desse lado fica em branco. Books com timestamp acima de 15 minutos são marcados como antigos e excluídos do EV. Quando a API não fornece timestamp, a idade é desconhecida; avisos de timestamp ausente e de falha ao consultar um outcome aparecem abaixo da respectiva faixa.
+- P(YES), Edge e EV ficam suspensos enquanto as regras de resolução não estiverem confirmadas e a ladder não for validada. O dashboard informa esse bloqueio; não marque `confirmed` antes de verificar as regras oficiais.
 - A coluna de preço implícito usa o meio do spread quando há bid e ask; é uma referência, não o custo executável.
 - A ladder é verificada para caudas, lacunas e sobreposições. Com regras confirmadas, a soma das probabilidades das faixas deve ficar próxima de 100%; caso contrário, o painel mostra um alerta.
 
