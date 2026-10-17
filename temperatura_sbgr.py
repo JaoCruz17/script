@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Radar de temperatura SBGR + ladder Polymarket.
 
-Os preços de mercado são observados pela API pública. A previsão diária e sua
-dispersão são calculadas automaticamente a partir dos membros do ensemble
-ECMWF IFS do Open-Meteo. Também é possível sobrescrever mu e sigma manualmente.
+Os preços vêm da API pública. A distribuição de temperatura usa os membros do
+ECMWF IFS e, quando aprovada pelo backtest histórico walk-forward de SBGR,
+combina também GFS e ICON. Também é possível sobrescrever mu e sigma.
 """
 
 from __future__ import annotations
@@ -13,10 +13,27 @@ from datetime import date, datetime
 import json
 import math
 import re
+import sys
 import time
 from typing import Any
 
 import requests
+from model_engine import (
+    Calibration,
+    MODEL_CONFIG,
+    calibrate_models,
+    choose_temperature_strategy,
+    empirical_bracket_probability,
+    fetch_previous_run_daily_max,
+    fetch_station_daily_max,
+    summarize_distribution,
+    weighted_member_distribution,
+)
+
+# Preserve Portuguese accents, Greek μ/σ, and table separators in Windows terminals.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 
 METAR_URL = "https://aviationweather.gov/api/data/metar"
@@ -29,6 +46,7 @@ SBGR_LONGITUDE = -46.4731
 HEADERS = {"User-Agent": "SBGR-temperature-ladder/1.0 (personal dashboard)"}
 SESSION = requests.Session()
 SESSION.headers.update(HEADERS)
+_CALIBRATION_CACHE: dict[int, tuple[float, Calibration]] = {}
 
 
 def get_json(url: str, params: dict[str, Any]) -> Any:
@@ -172,21 +190,26 @@ def taker_fee_per_contract(price: float, schedule: tuple[float, float] | None) -
     return rate * (price * (1.0 - price)) ** exponent
 
 
-def fetch_temperature_forecast(day: date) -> tuple[float, float, int, str]:
-    """Estimate daily-maximum mu and sigma from ECMWF IFS ensemble members."""
+def fetch_temperature_forecast(
+    day: date,
+    model: str = "ecmwf_ifs025_ensemble",
+    source_name: str = "ECMWF IFS ensemble 0,25° (~25 km)",
+    max_days: float = 15,
+) -> tuple[float, float, int, str, list[float]]:
+    """Estimate daily-maximum mu and sigma from an ensemble's members."""
     days_ahead = (day - date.today()).days
     if days_ahead < 0:
         raise ValueError("a previsão automática só está disponível para hoje ou datas futuras")
-    if days_ahead >= 15:
-        raise ValueError("o ensemble europeu ECMWF IFS cobre até 15 dias à frente")
+    if days_ahead >= max_days:
+        raise ValueError(f"o modelo {source_name} cobre até {max_days:g} dias à frente")
 
     payload = get_json(ENSEMBLE_URL, {
         "latitude": SBGR_LATITUDE,
         "longitude": SBGR_LONGITUDE,
         "daily": "temperature_2m_max",
-        "models": "ecmwf_ifs025_ensemble",
+        "models": model,
         "timezone": "America/Sao_Paulo",
-        "forecast_days": 15,
+        "forecast_days": math.ceil(max_days),
     })
     daily = payload.get("daily") or {}
     dates = daily.get("time") or []
@@ -212,7 +235,30 @@ def fetch_temperature_forecast(day: date) -> tuple[float, float, int, str]:
     sigma = math.sqrt(variance)
     if sigma <= 0:
         raise ValueError("o ensemble retornou dispersão nula; não é possível estimar probabilidades")
-    return mu, sigma, len(members), "ECMWF IFS ensemble 0,25° (~25 km)"
+    return mu, sigma, len(members), source_name, members
+
+
+def get_model_calibration(lead_days: int) -> Calibration:
+    """Fetch and cache 35-day fixed-lead verification data for SBGR."""
+    now = time.time()
+    cached = _CALIBRATION_CACHE.get(lead_days)
+    if cached and now - cached[0] < 6 * 60 * 60:
+        return cached[1]
+    if not 0 <= lead_days <= 7:
+        result = Calibration(False, lead_days, 0, {}, {}, {}, {}, None, None,
+                             "arquivo de verificação disponível apenas em D-0 a D-7")
+        _CALIBRATION_CACHE[lead_days] = (now, result)
+        return result
+
+    observations = fetch_station_daily_max()
+    historical: dict[str, dict[str, float]] = {}
+    for name, config in MODEL_CONFIG.items():
+        historical[name] = fetch_previous_run_daily_max(
+            config["history"], lead_days
+        )
+    result = calibrate_models(observations, historical, lead_days)
+    _CALIBRATION_CACHE[lead_days] = (time.time(), result)
+    return result
 
 
 def normal_cdf(x: float, mu: float, sigma: float) -> float:
@@ -245,15 +291,33 @@ def as_price(value: Any) -> float | None:
 
 def print_dashboard(day: date, mu: float | None, sigma: float | None,
                     forecast_info: tuple[int, str] | None = None,
-                    forecast_error: str | None = None) -> None:
+                    forecast_error: str | None = None,
+                    comparison_forecasts: dict[str, tuple[float, float, int, str] | str] | None = None,
+                    probability_distribution: list[tuple[float, float]] | None = None,
+                    calibration: Calibration | None = None) -> None:
     print("=" * 92)
     if mu is not None and sigma is not None:
         count, source = forecast_info or (0, "parâmetros informados manualmente")
         source_text = f"{source}; {count} membros" if count else source
         print(f"[PREVISÃO DA MÁXIMA] μ={mu:.2f} °C | σ={sigma:.2f} °C | {source_text}")
-        print("  Probabilidades derivadas de distribuição normal ajustada ao ensemble; não são garantias.")
+        if probability_distribution:
+            print("  Probabilidades calculadas pela frequência ponderada dos membros; são estimativas, não garantias.")
+        else:
+            print("  Probabilidades derivadas de distribuição normal ajustada ao ensemble; não são garantias.")
+        if calibration and calibration.enabled:
+            print("  P(YES) e EV usam a mistura ECMWF/GFS/ICON aprovada no walk-forward.")
+        elif probability_distribution:
+            print("  P(YES) e EV usam o ensemble ECMWF; GFS e ICON ficam como comparação porque a mistura não foi aprovada.")
+        else:
+            print("  P(YES) e EV usam esta previsão principal; GFS e ICON são exibidos para comparação.")
     elif forecast_error:
         print(f"[PREVISÃO DA MÁXIMA] indisponível: {forecast_error}")
+    for model_name, result in (comparison_forecasts or {}).items():
+        if isinstance(result, tuple):
+            model_mu, model_sigma, count, source = result
+            print(f"[PREVISÃO {model_name}] μ={model_mu:.2f} °C | σ={model_sigma:.2f} °C | {source}; {count} membros")
+        else:
+            print(f"[PREVISÃO {model_name}] indisponível: {result}")
     print(f"RADAR METEOROLÓGICO — SBGR | Ladder do dia {day:%d/%m/%Y}")
     print("=" * 92)
     try:
@@ -322,7 +386,11 @@ def print_dashboard(day: date, mu: float | None, sigma: float | None,
                 except requests.RequestException:
                     # Keep the rest of the ladder visible if the NO book is unavailable.
                     pass
-            probability = bracket_probability(str(label), mu, sigma) if mu is not None and sigma is not None else None
+            probability = (
+                empirical_bracket_probability(str(label), probability_distribution)
+                if probability_distribution
+                else bracket_probability(str(label), mu, sigma) if mu is not None and sigma is not None else None
+            )
             no_probability = 1.0 - probability if probability is not None else None
             schedule = market_fee_schedule(market)
             fee_yes = taker_fee_per_contract(ask, schedule) if ask is not None else None
@@ -344,6 +412,41 @@ def print_dashboard(day: date, mu: float | None, sigma: float | None,
         print("\n  B/A = best bid/ask; Spr. = Ask − Bid. O ask já incorpora o spread pago ao cruzar o livro;")
         print("  ele não é subtraído duas vezes. EV YES/NO e EV% já incluem o desconto da taxa taker do mercado.")
         print("  EV líquido = P(resultado) − Ask − taxa; EV% = EV líquido ÷ (Ask + taxa) × 100.")
+        if probability_distribution:
+            strategy = choose_temperature_strategy(
+                markets,
+                probability_distribution,
+                lambda price, market: taker_fee_per_contract(price, market_fee_schedule(market)),
+            )
+            print("\n  SUGESTÃO DE TEMPERATURA (estimativa; sem execução de ordens):")
+            if strategy:
+                labels = " + ".join(item["label"] for item in strategy["items"])
+                print(f"    {strategy['kind']}: {labels}")
+                print(f"    Probabilidade de acerto conjunta estimada: {strategy['probability'] * 100:.2f}%")
+                print(f"    Custo total estimado: ${strategy['cost']:.3f} | EV líquido: ${strategy['ev']:+.3f} | EV%: {strategy['roi'] * 100:+.2f}%")
+                print("    Considera taxa taker disponível; exclui slippage e não garante lucro.")
+            else:
+                print("    Nenhuma faixa ou cesta adjacente apresentou EV líquido positivo com as cotações atuais.")
+            if calibration:
+                if calibration.enabled:
+                    print(f"    Pesos validados em walk-forward D-{calibration.lead_days} ({calibration.sample_days} dias): "
+                          + ", ".join(f"{name} {weight:.0%}" for name, weight in calibration.weights.items()))
+                    if calibration.walkforward_ecmwf_rmse is not None and calibration.walkforward_blend_rmse is not None:
+                        print(f"    RMSE fora da amostra: ECMWF {calibration.walkforward_ecmwf_rmse:.2f}°C → mistura {calibration.walkforward_blend_rmse:.2f}°C")
+                else:
+                    print(f"    Mistura desativada; P/EV usa ECMWF sem combinação: {calibration.reason}.")
+                if calibration.sample_days and calibration.rmse:
+                    metric_lines = []
+                    for name in ("ECMWF", "GFS", "ICON"):
+                        if name in calibration.rmse:
+                            metric_lines.append(
+                                f"{name}: viés {calibration.biases[name]:+.2f}°C, "
+                                f"MAE {calibration.mae[name]:.2f}°C, "
+                                f"RMSE {calibration.rmse[name]:.2f}°C"
+                            )
+                    if metric_lines:
+                        print(f"    Verificação de máximas observadas em SBGR, D-{calibration.lead_days}, "
+                              f"{calibration.sample_days} dias: " + " | ".join(metric_lines))
         if mu is None:
             print("  Sem previsão: probabilidade estimada e EV não foram calculados.")
     except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
@@ -352,7 +455,7 @@ def print_dashboard(day: date, mu: float | None, sigma: float | None,
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Monitora temperaturas METAR de SBGR, previsão ECMWF e ladder Polymarket.")
+    parser = argparse.ArgumentParser(description="Monitora o METAR de SBGR, ensembles ECMWF/GFS/ICON e ladder Polymarket.")
     parser.add_argument("--date", type=date.fromisoformat, default=date.today(), help="Data do mercado, YYYY-MM-DD (padrão: hoje).")
     parser.add_argument("--mu", type=float, help="Substitui a média automática da máxima diária em °C (μ).")
     parser.add_argument("--sigma", type=float, help="Substitui o desvio padrão automático em °C (σ), maior que zero.")
@@ -374,14 +477,60 @@ def main() -> None:
         mu, sigma = args.mu, args.sigma
         forecast_info: tuple[int, str] | None = None
         forecast_error: str | None = None
-        if mu is None and sigma is None:
+        comparison_forecasts: dict[str, tuple[float, float, int, str] | str] = {}
+        model_specs = (
+            ("ECMWF", "ecmwf_ifs025_ensemble", "ECMWF IFS ensemble 0,25° (~25 km)", 15),
+            ("GFS", "ncep_gefs025", "GFS ensemble 0,25° (~25 km)", 10),
+            ("ICON", "dwd_icon_global_eps", "ICON global ensemble (~26 km)", 7.5),
+        )
+        member_sets: dict[str, list[float]] = {}
+        model_summaries: dict[str, tuple[float, float, int, str]] = {}
+        for model_name, model_id, source, horizon in model_specs:
             try:
-                forecast_mu, forecast_sigma, member_count, source = fetch_temperature_forecast(args.date)
-                mu, sigma = forecast_mu, forecast_sigma
-                forecast_info = (member_count, source)
+                result = fetch_temperature_forecast(args.date, model_id, source, horizon)
+                model_mu, model_sigma, count, model_source, members = result
+                member_sets[model_name] = members
+                model_summaries[model_name] = (model_mu, model_sigma, count, model_source)
+                if model_name != "ECMWF":
+                    comparison_forecasts[model_name] = model_summaries[model_name]
             except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
-                forecast_error = str(exc)
-        print_dashboard(args.date, mu, sigma, forecast_info, forecast_error)
+                if model_name == "ECMWF" and mu is None:
+                    forecast_error = str(exc)
+                elif model_name != "ECMWF":
+                    comparison_forecasts[model_name] = str(exc)
+
+        probability_distribution: list[tuple[float, float]] | None = None
+        calibration: Calibration | None = None
+        if args.mu is None and args.sigma is None and "ECMWF" in member_sets:
+            lead_days = max(0, (args.date - date.today()).days)
+            try:
+                calibration = get_model_calibration(lead_days)
+            except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+                calibration = Calibration(False, lead_days, 0, {}, {}, {}, {}, None, None,
+                                           f"não foi possível obter o histórico: {exc}")
+            if calibration.enabled and not all(name in member_sets for name in MODEL_CONFIG):
+                calibration.enabled = False
+                calibration.reason = "um ou mais ensembles atuais estão indisponíveis"
+            probability_distribution = weighted_member_distribution(member_sets, calibration)
+            if probability_distribution:
+                mu, sigma = summarize_distribution(probability_distribution)
+            else:
+                mu, sigma, count, source = model_summaries["ECMWF"]
+                forecast_info = (count, source)
+            if calibration.enabled:
+                weights_text = ", ".join(
+                    f"{name} {weight:.0%}" for name, weight in calibration.weights.items()
+                )
+                forecast_info = (sum(len(values) for values in member_sets.values()),
+                                 f"mistura multimodelo calibrada — {weights_text}")
+            elif probability_distribution:
+                count = len(member_sets["ECMWF"])
+                forecast_info = (count, "ECMWF IFS ensemble (mistura não aprovada no backtest)")
+        elif mu is not None and sigma is not None:
+            forecast_info = (0, "μ e σ informados manualmente")
+
+        print_dashboard(args.date, mu, sigma, forecast_info, forecast_error,
+                        comparison_forecasts, probability_distribution, calibration)
         if not args.watch:
             break
         try:
